@@ -1,25 +1,28 @@
 #![no_std]
 #![no_main]
 
+use defmt::info;
 use embassy_executor::Spawner;
-use embassy_stm32::Config;
-use embassy_stm32::time::Hertz;
-use defmt_rtt as _;
+use embassy_stm32::usart::{BufferedInterruptHandler, BufferedUart, Config};
+use embassy_stm32::{bind_interrupts, peripherals};
+use static_cell::StaticCell;
 
 mod cli;
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
-}
+// 引入 panic handler
+use {defmt_rtt as _, panic_probe as _};
+
+bind_interrupts!(struct Irqs {
+    USART2 => BufferedInterruptHandler<peripherals::USART2>;
+});
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    let mut config = Config::default();
+    let mut config = embassy_stm32::Config::default();
 
     // 配置 HSE 8MHz
     config.rcc.hse = Some(embassy_stm32::rcc::Hse {
-        freq: Hertz(8_000_000),
+        freq: embassy_stm32::time::Hertz(8_000_000),
         mode: embassy_stm32::rcc::HseMode::Oscillator,
     });
 
@@ -33,22 +36,29 @@ async fn main(_spawner: Spawner) {
         divr: None,
     });
 
-    // 配置外设
     let p = embassy_stm32::init(config);
 
-    // 配置 USART2: PB3 = TX, PB4 = RX, 1843200 波特率
-    let mut usart_config = embassy_stm32::usart::Config::default();
+    info!("STM32G431 FOC initialized");
+
+    // 配置 USART2: PB3 = TX, PB4 = RX, 115200 波特率
+    let mut usart_config = Config::default();
     usart_config.baudrate = 115200;
 
-    // 使用阻塞 UART (PB3=TX, PB4=RX)
-    let mut usart = embassy_stm32::usart::Uart::new_blocking(
+    static TX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
+    static RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
+
+    let usart = BufferedUart::new(
         p.USART2,
-        p.PB4,
-        p.PB3,
+        p.PB4,  // RX
+        p.PB3,  // TX
+        TX_BUF.init([0u8; 256]),
+        RX_BUF.init([0u8; 256]),
+        Irqs,
         usart_config,
     ).unwrap();
-    let welcome_msg = b"Welcome to G431 CLI\r\n";
-    usart.blocking_write(welcome_msg).unwrap();
+
+    info!("USART2 initialized on PB3/PB4 @ 115200 baud");
+
     // 运行 CLI
     cli::run(usart).await;
 }

@@ -1,59 +1,63 @@
-use embassy_stm32::usart::Uart;
-use embassy_stm32::mode::Blocking;
-use heapless::{String, Vec};
-use embedded_hal_nb::serial::{Read, Write as NbWrite};
-use nb::block;
+use embassy_stm32::usart::BufferedUart;
+use embedded_io_async::{Read, Write};
+use heapless::String;
+use core::fmt::Write as FmtWrite;
 
 const CMD_BUF_SIZE: usize = 128;
-const HIST_SIZE: usize = 16;
 
-pub async fn run(mut usart: Uart<'static, Blocking>) {
-    let mut state = CliState::new();
+// 定义 CLI 命令
+enum Command<'a> {
+    Help,
+    Status,
+    Clear,
+    Speed(u16),
+    Position,
+    Velocity,
+    History,
+    Set { param: &'a str, value: u32 },
+    Get { param: &'a str },
+    Unknown,
+}
 
-    // 打印欢迎信息
-    write_str(&mut usart, "STM32G431 FOC Shell\r\n").ok();
-    write_str(&mut usart, "Type 'help' for commands\r\n\r\n").ok();
-    write_prompt(&mut usart).ok();
+pub async fn run(usart: BufferedUart<'static>) {
+    let (mut tx, mut rx) = usart.split();
 
-    // CLI 主循环
+    // 发送欢迎信息
+    let _ = tx.write_all(b"\r\nSTM32G431 FOC Shell\r\n").await;
+    let _ = tx.write_all(b"Type 'help' for commands\r\n").await;
+
+    let mut cmd_buf: String<CMD_BUF_SIZE> = String::new();
+    let mut byte = [0u8; 1];
+
+    let _ = write_prompt(&mut tx).await;
+
     loop {
-        // 读取一个字节 - 使用阻塞读取
-        match block!(usart.read()) {
-            Ok(byte) => {
-                // 回显
-                block!(usart.write(byte)).ok();
+        match rx.read(&mut byte).await {
+            Ok(0) => continue,
+            Ok(_) => {
+                match byte[0] {
+                    b'\r' | b'\n' => {
+                        // 回车 - 处理命令
+                        let _ = tx.write_all(b"\r\n").await;
 
-                // 处理字符
-                match byte {
-                    b'\r' => {
-                        // 回车
-                        block!(usart.write(b'\n')).ok();
-
-                        if !state.cmd_buf.is_empty() {
-                            let cmd_str: String<CMD_BUF_SIZE> = core::clone::Clone::clone(&state.cmd_buf);
-                            let response = process_command(cmd_str.as_str());
-                            state.add_to_history(cmd_str.as_str());
-
-                            write_str(&mut usart, response).ok();
-
-                            state.cmd_buf.clear();
+                        if !cmd_buf.is_empty() {
+                            let cmd = parse_command(cmd_buf.as_str());
+                            handle_command(&mut tx, &cmd).await;
+                            cmd_buf.clear();
                         }
-                        write_prompt(&mut usart).ok();
+
+                        let _ = write_prompt(&mut tx).await;
                     }
-                    b'\n' => {
-                        // 忽略换行
-                    }
-                    b'\x08' | b'\x7f' => {
+                    0x08 | 0x7F => {
                         // 退格
-                        if state.cmd_buf.pop().is_some() {
-                            block!(usart.write(b' ')).ok();
-                            block!(usart.write(b'\x08')).ok();
+                        if cmd_buf.pop().is_some() {
+                            let _ = tx.write_all(b"\x08 \x08").await;
                         }
                     }
-                    _ if byte >= 32 && byte <= 126 => {
-                        if state.cmd_buf.push(byte as char).is_err() {
-                            write_str(&mut usart, "\r\nBuffer overflow\r\n").ok();
-                            state.cmd_buf.clear();
+                    b if b >= 0x20 && b <= 0x7E => {
+                        // 可打印字符
+                        if cmd_buf.push(b as char).is_ok() {
+                            let _ = tx.write_all(&[b]).await;
                         }
                     }
                     _ => {}
@@ -64,90 +68,99 @@ pub async fn run(mut usart: Uart<'static, Blocking>) {
     }
 }
 
-fn write_str<W: NbWrite>(usart: &mut W, s: &str) -> Result<(), W::Error> {
-    for &byte in s.as_bytes() {
-        block!(usart.write(byte))?;
-    }
-    Ok(())
+async fn write_prompt(tx: &mut embassy_stm32::usart::BufferedUartTx<'static>) -> Result<(), embassy_stm32::usart::Error> {
+    tx.write_all(b"G431> ").await
 }
 
-fn write_prompt<W: NbWrite>(usart: &mut W) -> Result<(), W::Error> {
-    write_str(usart, "STM32G431 FOC> ")
-}
+fn parse_command(input: &str) -> Command<'_> {
+    let input = input.trim();
+    let parts: heapless::Vec<&str, 4> = input.split_whitespace().collect();
 
-// 命令处理函数
-fn process_command(cmd: &str) -> &'static str {
-    match cmd.trim() {
-        "help" => {
-            "Available commands:\r\n\
-             help     - Show this help\r\n\
-             status   - Show system status\r\n\
-             clear    - Clear screen\r\n\
-             speed    - Set motor speed (0-100)\r\n\
-             position - Get motor position\r\n\
-             velocity - Get motor velocity\r\n\
-             history  - Show command history\r\n\
-             set      - Set parameter (set <param> <value>)\r\n\
-             get      - Get parameter (get <param>)\r\n"
-        }
-        "status" => {
-            "System: STM32G431 FOC\r\n\
-             Clock: 160MHz\r\n\
-             UART: 1843200 baud\r\n\
-             HSE: 8MHz\r\n\
-             FOC: Ready\r\n"
-        }
-        "clear" => "\x1B[2J\x1B[H",
-        "position" => "Position: 0\r\n",
-        "velocity" => "Velocity: 0 rpm\r\n",
-        "history" => "History: (not shown - use up/down)\r\n",
-        s if s.starts_with("speed ") => {
-            if let Ok(val) = s[6..].trim().parse::<u16>() {
-                if val <= 100 {
-                    return "Speed updated\r\n";
-                }
+    match parts.as_slice() {
+        ["help"] => Command::Help,
+        ["status"] => Command::Status,
+        ["clear"] => Command::Clear,
+        ["speed", val] => {
+            if let Ok(v) = val.parse::<u16>() {
+                Command::Speed(v)
+            } else {
+                Command::Unknown
             }
-            "Usage: speed <0-100>\r\n"
         }
-        s if s.starts_with("set ") => "Set parameter (not implemented)\r\n",
-        s if s.starts_with("get ") => "Get parameter (not implemented)\r\n",
-        "" => "",
-        _ => "Unknown command. Type 'help' for available commands.\r\n",
+        ["position"] => Command::Position,
+        ["velocity"] => Command::Velocity,
+        ["history"] => Command::History,
+        ["set", param, val] => {
+            if let Ok(v) = val.parse::<u32>() {
+                Command::Set { param, value: v }
+            } else {
+                Command::Unknown
+            }
+        }
+        ["get", param] => Command::Get { param },
+        [] => Command::Unknown,
+        _ => Command::Unknown,
     }
 }
 
-// CLI 状态
-struct CliState {
-    cmd_buf: String<CMD_BUF_SIZE>,
-    history: Vec<String<CMD_BUF_SIZE>, HIST_SIZE>,
-}
-
-impl CliState {
-    fn new() -> Self {
-        Self {
-            cmd_buf: String::new(),
-            history: Vec::new(),
+async fn handle_command(tx: &mut embassy_stm32::usart::BufferedUartTx<'static>, cmd: &Command<'_>) {
+    match cmd {
+        Command::Help => {
+            let _ = tx.write_all(
+                b"Available commands:\r\n\
+                  help           - Show this help\r\n\
+                  status         - Show system status\r\n\
+                  clear          - Clear screen\r\n\
+                  speed <0-100>  - Set motor speed\r\n\
+                  position       - Get motor position\r\n\
+                  velocity       - Get motor velocity\r\n\
+                  history        - Show command history\r\n\
+                  set <p> <v>    - Set parameter\r\n\
+                  get <p>        - Get parameter\r\n"
+            ).await;
         }
-    }
-
-    fn add_to_history(&mut self, cmd: &str) {
-        if cmd.is_empty() {
-            return;
+        Command::Status => {
+            let _ = tx.write_all(
+                b"System: STM32G431 FOC\r\n\
+                  Clock: 160MHz\r\n\
+                  UART: 115200 baud\r\n\
+                  HSE: 8MHz\r\n\
+                  FOC: Ready\r\n"
+            ).await;
         }
-        if let Some(last) = self.history.last() {
-            if last == cmd {
-                return;
+        Command::Clear => {
+            let _ = tx.write_all(b"\x1B[2J\x1B[H").await;
+        }
+        Command::Speed(value) => {
+            if *value <= 100 {
+                let mut resp: String<32> = String::new();
+                write!(&mut resp, "Speed set to {}\r\n", value).ok();
+                let _ = tx.write_all(resp.as_bytes()).await;
+            } else {
+                let _ = tx.write_all(b"Error: Speed must be 0-100\r\n").await;
             }
         }
-        let mut new_cmd: String<CMD_BUF_SIZE> = String::new();
-        if new_cmd.push_str(cmd).is_ok() {
-            if self.history.push(new_cmd).is_err() {
-                self.history.rotate_left(1);
-                let _ = self.history.pop();
-                let mut retry_cmd: String<CMD_BUF_SIZE> = String::new();
-                let _ = retry_cmd.push_str(cmd);
-                let _ = self.history.push(retry_cmd);
-            }
+        Command::Position => {
+            let _ = tx.write_all(b"Position: 0\r\n").await;
+        }
+        Command::Velocity => {
+            let _ = tx.write_all(b"Velocity: 0 rpm\r\n").await;
+        }
+        Command::History => {
+            let _ = tx.write_all(b"Use up/down arrows (not implemented)\r\n").await;
+        }
+        Command::Set { param, value } => {
+            let mut resp: String<64> = String::new();
+            write!(&mut resp, "Set {} = {}\r\n", param, value).ok();
+            let _ = tx.write_all(resp.as_bytes()).await;
+        }
+        Command::Get { param } => {
+            let mut resp: String<64> = String::new();
+            write!(&mut resp, "Get {}: 0\r\n", param).ok();
+            let _ = tx.write_all(resp.as_bytes()).await;
+        }
+        Command::Unknown => {
+            // 空输入时不显示错误
         }
     }
 }

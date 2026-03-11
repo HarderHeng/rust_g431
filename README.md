@@ -39,13 +39,14 @@
 
 ## 依赖项
 
-- `embassy-stm32` - STM32 外设支持
-- `embassy-executor` - 异步任务执行器
-- `embassy-time` - 时间管理
-- `defmt` / `defmt-rtt` - 高效日志输出
-- `embedded-hal` - 嵌入式 HAL 抽象
+- `embassy-stm32` (0.5.0) - STM32 外设支持，异步驱动
+- `embassy-executor` (0.6) - 异步任务执行器
+- `embassy-time` (0.5) - 时间管理
+- `defmt` / `defmt-rtt` / `panic-probe` - 高效日志输出和 panic 处理
+- `embedded-io-async` - 异步 IO trait
 - `heapless` - 无堆数据结构
 - `cortex-m` / `cortex-m-rt` - Cortex-M 运行时支持
+- `static_cell` - 静态内存分配
 
 ## 构建与烧录
 
