@@ -1,5 +1,6 @@
+use defmt::info;
 use embassy_stm32::usart::{BufferedInterruptHandler, BufferedUart, Config};
-use embassy_stm32::{bind_interrupts, peripherals, Peripherals};
+use embassy_stm32::{bind_interrupts, peripherals};
 use static_cell::StaticCell;
 
 use crate::driver::serial::Serial;
@@ -17,13 +18,19 @@ pub struct BoardPeripherals {
     // pub encoder: driver::encoder_timer::QepEncoder,
 }
 
-/// 将 embassy 裸外设拆解并组装为 BoardPeripherals
-pub fn init(p: Peripherals) -> BoardPeripherals {
+/// 完成 HAL 初始化并组装 BoardPeripherals：
+/// 1. 调用 bsp::clock 获取时钟配置
+/// 2. 调用 embassy_stm32::init 初始化 HAL，取得裸外设句柄
+/// 3. 实例化各 driver，填充并返回 BoardPeripherals
+pub fn init() -> BoardPeripherals {
+    let p = embassy_stm32::init(crate::bsp::clock::configure());
+    info!("STM32G431CBU6 @ 170MHz");
     static TX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
     static RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
 
     let mut usart_config = Config::default();
     usart_config.baudrate = 115200;
+    info!("USART2 PB3(TX)/PB4(RX) @ 115200");
 
     // BufferedUart::new 参数顺序: (peri, rx, tx, tx_buffer, rx_buffer, irq, config)
     let usart = BufferedUart::new(
