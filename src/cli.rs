@@ -1,166 +1,164 @@
 use embassy_stm32::usart::BufferedUart;
-use embedded_io_async::{Read, Write};
-use heapless::String;
-use core::fmt::Write as FmtWrite;
+use embedded_io_async::Read as AsyncRead;
+use static_cell::StaticCell;
 
-const CMD_BUF_SIZE: usize = 128;
+use embedded_cli::cli::CliBuilder;
+use embedded_cli::Command;
 
-// 定义 CLI 命令
-enum Command<'a> {
-    Help,
+// embedded-cli 使用 embedded_io 0.6，而 embassy-stm32 实现的是 embedded_io 0.7
+// 需要一个 newtype 适配器将 0.7 的 Write 适配为 0.6 的 Write
+struct UartWriter(embassy_stm32::usart::BufferedUartTx<'static>);
+
+impl embedded_io_v06::ErrorType for UartWriter {
+    type Error = embedded_io_v06::ErrorKind;
+}
+
+impl embedded_io_v06::Write for UartWriter {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        embedded_io::Write::write(&mut self.0, buf)
+            .map_err(|_| embedded_io_v06::ErrorKind::Other)
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        embedded_io::Write::flush(&mut self.0)
+            .map_err(|_| embedded_io_v06::ErrorKind::Other)
+    }
+}
+
+// FOC Shell 命令定义
+#[derive(Command)]
+enum FocCommand<'a> {
+    /// Show system status
     Status,
-    Clear,
-    Speed(u16),
+    /// Set motor speed (0-100)
+    Speed {
+        /// Speed value (0-100)
+        value: u16,
+    },
+    /// Get motor position
     Position,
+    /// Get motor velocity
     Velocity,
-    History,
-    Set { param: &'a str, value: u32 },
-    Get { param: &'a str },
-    Unknown,
+    /// Set a parameter value
+    Set {
+        /// Parameter name
+        param: &'a str,
+        /// Parameter value
+        value: u32,
+    },
+    /// Get a parameter value
+    Get {
+        /// Parameter name
+        param: &'a str,
+    },
 }
 
 pub async fn run(usart: BufferedUart<'static>) {
-    let (mut tx, mut rx) = usart.split();
+    let (tx, mut rx) = usart.split();
 
-    // 发送欢迎信息
-    let _ = tx.write_all(b"\r\nSTM32G431 FOC Shell\r\n").await;
-    let _ = tx.write_all(b"Type 'help' for commands\r\n").await;
+    static CMD_BUF: StaticCell<[u8; 128]> = StaticCell::new();
+    static HIST_BUF: StaticCell<[u8; 256]> = StaticCell::new();
 
-    let mut cmd_buf: String<CMD_BUF_SIZE> = String::new();
+    let writer = UartWriter(tx);
+
+    let mut cli = CliBuilder::default()
+        .writer(writer)
+        .command_buffer(CMD_BUF.init([0u8; 128]).as_mut_slice())
+        .history_buffer(HIST_BUF.init([0u8; 256]).as_mut_slice())
+        .prompt("G431> ")
+        .build()
+        .unwrap();
+
     let mut byte = [0u8; 1];
-
-    let _ = write_prompt(&mut tx).await;
 
     loop {
         match rx.read(&mut byte).await {
             Ok(0) => continue,
             Ok(_) => {
-                match byte[0] {
-                    b'\r' | b'\n' => {
-                        // 回车 - 处理命令
-                        let _ = tx.write_all(b"\r\n").await;
-
-                        if !cmd_buf.is_empty() {
-                            let cmd = parse_command(cmd_buf.as_str());
-                            handle_command(&mut tx, &cmd).await;
-                            cmd_buf.clear();
+                let _ = cli.process_byte::<FocCommand, _>(
+                    byte[0],
+                    &mut FocCommand::processor(|cli, cmd| {
+                        match cmd {
+                            FocCommand::Status => {
+                                cli.writer().write_str("System: STM32G431CBU6\r\n")?;
+                                cli.writer().write_str("Clock:  170MHz (HSE 8MHz via PLL)\r\n")?;
+                                cli.writer().write_str("UART:   USART2 PB3/PB4 @ 115200\r\n")?;
+                                cli.writer().write_str("FOC:    Ready\r\n")?;
+                            }
+                            FocCommand::Speed { value } => {
+                                if value <= 100 {
+                                    cli.writer().write_str("Speed set to ")?;
+                                    cli.writer().write_str(u16_to_str(value).as_str())?;
+                                    cli.writer().write_str("\r\n")?;
+                                } else {
+                                    cli.writer().write_str("Error: speed must be 0-100\r\n")?;
+                                }
+                            }
+                            FocCommand::Position => {
+                                cli.writer().write_str("Position: 0 deg\r\n")?;
+                            }
+                            FocCommand::Velocity => {
+                                cli.writer().write_str("Velocity: 0 rpm\r\n")?;
+                            }
+                            FocCommand::Set { param, value } => {
+                                cli.writer().write_str("Set ")?;
+                                cli.writer().write_str(param)?;
+                                cli.writer().write_str(" = ")?;
+                                cli.writer().write_str(u32_to_str(value).as_str())?;
+                                cli.writer().write_str("\r\n")?;
+                            }
+                            FocCommand::Get { param } => {
+                                cli.writer().write_str("Get ")?;
+                                cli.writer().write_str(param)?;
+                                cli.writer().write_str(": 0\r\n")?;
+                            }
                         }
-
-                        let _ = write_prompt(&mut tx).await;
-                    }
-                    0x08 | 0x7F => {
-                        // 退格
-                        if cmd_buf.pop().is_some() {
-                            let _ = tx.write_all(b"\x08 \x08").await;
-                        }
-                    }
-                    b if b >= 0x20 && b <= 0x7E => {
-                        // 可打印字符
-                        if cmd_buf.push(b as char).is_ok() {
-                            let _ = tx.write_all(&[b]).await;
-                        }
-                    }
-                    _ => {}
-                }
+                        Ok(())
+                    }),
+                );
             }
             Err(_) => break,
         }
     }
 }
 
-async fn write_prompt(tx: &mut embassy_stm32::usart::BufferedUartTx<'static>) -> Result<(), embassy_stm32::usart::Error> {
-    tx.write_all(b"G431> ").await
+// 避免使用 format! (需要 alloc)，手动实现简单的整数转字符串
+fn u16_to_str(val: u16) -> heapless::String<8> {
+    let mut s: heapless::String<8> = heapless::String::new();
+    let mut n = val;
+    if n == 0 {
+        s.push('0').ok();
+        return s;
+    }
+    let mut buf = [0u8; 8];
+    let mut i = 8usize;
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    for &b in &buf[i..] {
+        s.push(b as char).ok();
+    }
+    s
 }
 
-fn parse_command(input: &str) -> Command<'_> {
-    let input = input.trim();
-    let parts: heapless::Vec<&str, 4> = input.split_whitespace().collect();
-
-    match parts.as_slice() {
-        ["help"] => Command::Help,
-        ["status"] => Command::Status,
-        ["clear"] => Command::Clear,
-        ["speed", val] => {
-            if let Ok(v) = val.parse::<u16>() {
-                Command::Speed(v)
-            } else {
-                Command::Unknown
-            }
-        }
-        ["position"] => Command::Position,
-        ["velocity"] => Command::Velocity,
-        ["history"] => Command::History,
-        ["set", param, val] => {
-            if let Ok(v) = val.parse::<u32>() {
-                Command::Set { param, value: v }
-            } else {
-                Command::Unknown
-            }
-        }
-        ["get", param] => Command::Get { param },
-        [] => Command::Unknown,
-        _ => Command::Unknown,
+fn u32_to_str(val: u32) -> heapless::String<12> {
+    let mut s: heapless::String<12> = heapless::String::new();
+    let mut n = val;
+    if n == 0 {
+        s.push('0').ok();
+        return s;
     }
-}
-
-async fn handle_command(tx: &mut embassy_stm32::usart::BufferedUartTx<'static>, cmd: &Command<'_>) {
-    match cmd {
-        Command::Help => {
-            let _ = tx.write_all(
-                b"Available commands:\r\n\
-                  help           - Show this help\r\n\
-                  status         - Show system status\r\n\
-                  clear          - Clear screen\r\n\
-                  speed <0-100>  - Set motor speed\r\n\
-                  position       - Get motor position\r\n\
-                  velocity       - Get motor velocity\r\n\
-                  history        - Show command history\r\n\
-                  set <p> <v>    - Set parameter\r\n\
-                  get <p>        - Get parameter\r\n"
-            ).await;
-        }
-        Command::Status => {
-            let _ = tx.write_all(
-                b"System: STM32G431 FOC\r\n\
-                  Clock: 160MHz\r\n\
-                  UART: 115200 baud\r\n\
-                  HSE: 8MHz\r\n\
-                  FOC: Ready\r\n"
-            ).await;
-        }
-        Command::Clear => {
-            let _ = tx.write_all(b"\x1B[2J\x1B[H").await;
-        }
-        Command::Speed(value) => {
-            if *value <= 100 {
-                let mut resp: String<32> = String::new();
-                write!(&mut resp, "Speed set to {}\r\n", value).ok();
-                let _ = tx.write_all(resp.as_bytes()).await;
-            } else {
-                let _ = tx.write_all(b"Error: Speed must be 0-100\r\n").await;
-            }
-        }
-        Command::Position => {
-            let _ = tx.write_all(b"Position: 0\r\n").await;
-        }
-        Command::Velocity => {
-            let _ = tx.write_all(b"Velocity: 0 rpm\r\n").await;
-        }
-        Command::History => {
-            let _ = tx.write_all(b"Use up/down arrows (not implemented)\r\n").await;
-        }
-        Command::Set { param, value } => {
-            let mut resp: String<64> = String::new();
-            write!(&mut resp, "Set {} = {}\r\n", param, value).ok();
-            let _ = tx.write_all(resp.as_bytes()).await;
-        }
-        Command::Get { param } => {
-            let mut resp: String<64> = String::new();
-            write!(&mut resp, "Get {}: 0\r\n", param).ok();
-            let _ = tx.write_all(resp.as_bytes()).await;
-        }
-        Command::Unknown => {
-            // 空输入时不显示错误
-        }
+    let mut buf = [0u8; 12];
+    let mut i = 12usize;
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
     }
+    for &b in &buf[i..] {
+        s.push(b as char).ok();
+    }
+    s
 }
